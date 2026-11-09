@@ -1,22 +1,20 @@
 // Spotify → YouTube for Couchmate – an extension of the YouTube plugin.
 //
-// - Log in with Spotify once (the plugin's page in the admin panel). Your playlists, liked songs and the playlists
-//   you follow are read and kept on this server, and checked again every 30 minutes.
+// - Write Spotify usernames (or profile links) in the settings: the public playlists on those profiles are read
+//   from Spotify's public web pages – no login, no Spotify app. Single playlist links can be added too. They are
+//   read again every 30 minutes.
 // - Every song is matched to a YouTube video in the background (with the YouTube plugin's findVideo) and the match
-//   is remembered. Nothing is created on YouTube or Spotify.
-// - Write "spotify-youtube" as a topic in the YouTube plugin's settings: a row with your playlists shows at the top
+//   is remembered. Nothing is created on YouTube or Spotify; everything is kept on this server.
+// - Write "spotify-youtube" as a topic in the YouTube plugin's settings: a row with the playlists shows at the top
 //   of its front page. They open, play, queue and can be added to favourites like YouTube playlists.
 
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const API = 'https://api.spotify.com/v1';
-const ACCOUNTS = 'https://accounts.spotify.com';
-const SCOPES = 'playlist-read-private playlist-read-collaborative user-library-read';
 const YOUTUBE = 'youtube';
 const SPOTIFY_ID = /^[A-Za-z0-9]{22}$/;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const USER_ID = /^[A-Za-z0-9._-]{1,64}$/;
+const HEADERS = { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Couchmate', 'accept-language': 'en' };
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 export default function setup(api) {
@@ -26,161 +24,124 @@ export default function setup(api) {
   const load = (name, fallback) => { try { return JSON.parse(fs.readFileSync(file(name), 'utf8')); } catch { return fallback; } };
   const save = (name, value) => { fs.writeFileSync(`${file(name)}.tmp`, JSON.stringify(value)); fs.renameSync(`${file(name)}.tmp`, file(name)); };
 
-  let token = load('token.json', null); // { access, refresh, expiresAt, user: { id, name } }
-  let library = load('library.json', { playlists: [], syncedAt: null }); // [{ id, name, image, owner, own, snapshot, tracks: [{ key, title, artists, duration }] }]
+  // playlists: [{ id, name, image, owner, tracks: [{ key, title, artists, duration }] }]
+  let library = load('library.json', { playlists: [], users: [], syncedAt: null });
+  if (!Array.isArray(library.users)) library.users = [];
   const matches = load('matches.json', {}); // Spotify track id → { v: YouTube video id } or { none: time }
-  const logins = new Map(); // state → { verifier, at } while someone is logging in
-  const status = { syncing: false, error: null, left: 0 };
+  const status = { syncing: false, errors: [], left: 0 };
   let stopped = false;
   const timers = [];
 
-  // ------------------------------------------------------------------ logging in (OAuth with PKCE – no secret needed)
+  // ------------------------------------------------------------------ reading Spotify's public pages
 
-  const b64url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  /** "valonialol", "https://open.spotify.com/user/valonialol?si=…" or "spotify:user:valonialol" → "valonialol". */
+  const userOf = (v) => {
+    const t = String(v || '').trim();
+    const m = /(?:open\.spotify\.com\/(?:intl-[a-z-]+\/)?user\/|spotify:user:)([^/?#\s]+)/i.exec(t);
+    const id = m ? decodeURIComponent(m[1]) : t;
+    return USER_ID.test(id) ? id : null;
+  };
+  /** A playlist link, "spotify:playlist:…" or a bare id → the id. */
+  const playlistOf = (v) => {
+    const t = String(v || '').trim();
+    const m = /playlist[/:]([A-Za-z0-9]{22})/.exec(t);
+    return m ? m[1] : SPOTIFY_ID.test(t) ? t : null;
+  };
+  const list = (v) => String(v || '').split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
 
-  function authorizeUrl() {
-    if (!s().clientId) throw new Error('Fill in the Spotify Client ID in the plugin\'s settings first');
-    const verifier = b64url(crypto.randomBytes(48));
-    const state = b64url(crypto.randomBytes(16));
-    for (const [k, v] of logins) if (Date.now() - v.at > 15 * 60 * 1000) logins.delete(k);
-    logins.set(state, { verifier, at: Date.now() });
-    const q = new URLSearchParams({
-      client_id: s().clientId.trim(), response_type: 'code', redirect_uri: s().redirectUri.trim(), scope: SCOPES, state,
-      code_challenge_method: 'S256', code_challenge: b64url(crypto.createHash('sha256').update(verifier).digest()),
-    });
-    return `${ACCOUNTS}/authorize?${q}`;
+  async function page(url) {
+    const r = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(20000) });
+    if (r.status === 404) throw new Error('not found on Spotify');
+    if (!r.ok) throw new Error(`Spotify answered ${r.status}`);
+    return r.text();
   }
 
-  async function tokenRequest(body) {
-    const r = await fetch(`${ACCOUNTS}/api/token`, {
-      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ client_id: s().clientId.trim(), ...body }), signal: AbortSignal.timeout(15000),
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(d.error_description || d.error || `Spotify answered ${r.status}`);
-    return d;
+  /** The data a public open.spotify.com page carries (what the page shows before any script runs). */
+  function initialState(html) {
+    const m = /<script id="initialState" type="text\/plain">([^<]*)<\/script>/.exec(html);
+    if (!m) throw new Error('Spotify\'s page has changed');
+    return JSON.parse(Buffer.from(m[1], 'base64').toString('utf8'));
   }
 
-  /** The end of a login: the code Spotify sent back (to /callback, or pasted in the admin page). */
-  async function finishLogin(code, state) {
-    const l = logins.get(String(state || ''));
-    if (!l) throw new Error('This login has expired – start it again');
-    logins.delete(state);
-    const d = await tokenRequest({ grant_type: 'authorization_code', code: String(code || ''), redirect_uri: s().redirectUri.trim(), code_verifier: l.verifier });
-    token = { access: d.access_token, refresh: d.refresh_token, expiresAt: Date.now() + (Number(d.expires_in) - 60) * 1000 };
-    const me = await spotify('/me');
-    token.user = { id: me.id, name: me.display_name || me.id };
-    save('token.json', token);
-    api.log(`logged in as ${token.user.name}`);
-    sync();
-  }
+  const imageOfEntity = (images) => {
+    const src = images?.items?.[0]?.sources || [];
+    return [...src].sort((a, b) => (b.width || 0) - (a.width || 0))[0]?.url || null;
+  };
 
-  function logout() {
-    token = null;
-    try { fs.unlinkSync(file('token.json')); } catch { /* already gone */ }
-    library = { playlists: [], syncedAt: null };
-    save('library.json', library);
-    api.log('logged out');
-  }
-
-  async function accessToken() {
-    if (!token?.refresh) throw new Error('Not logged in to Spotify');
-    if (token.access && Date.now() < token.expiresAt) return token.access;
-    const d = await tokenRequest({ grant_type: 'refresh_token', refresh_token: token.refresh });
-    token = { ...token, access: d.access_token, refresh: d.refresh_token || token.refresh, expiresAt: Date.now() + (Number(d.expires_in) - 60) * 1000 };
-    save('token.json', token);
-    return token.access;
-  }
-
-  async function spotify(pathOrUrl) {
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const r = await fetch(pathOrUrl.startsWith('https://') ? pathOrUrl : `${API}${pathOrUrl}`, {
-        headers: { authorization: `Bearer ${await accessToken()}` }, signal: AbortSignal.timeout(20000),
-      });
-      if (r.status === 429) { await sleep(Math.min(30, Number(r.headers.get('retry-after')) || 2) * 1000); continue; }
-      if (r.status === 401 && attempt === 0) { token.expiresAt = 0; continue; }
-      if (!r.ok) {
-        const d = await r.json().catch(() => ({}));
-        throw new Error(d.error?.message || `Spotify answered ${r.status}`);
-      }
-      return r.json();
+  /** A profile's name and public playlists (the ones shown on the profile). */
+  async function profile(user) {
+    const read = async (url) => initialState(await page(url)).entities?.items?.[`spotify:user:${user}`];
+    let u = await read(`https://open.spotify.com/user/${encodeURIComponent(user)}`);
+    if (!u) throw new Error('not found on Spotify');
+    // The profile page shows the first ones; the profile's playlist page may show more.
+    if ((u.publicPlaylistsV2?.totalCount || 0) > (u.publicPlaylistsV2?.items?.length || 0)) {
+      const more = await read(`https://open.spotify.com/user/${encodeURIComponent(user)}/playlists`).catch(() => null);
+      if ((more?.publicPlaylistsV2?.items?.length || 0) > u.publicPlaylistsV2.items.length) u = { ...u, publicPlaylistsV2: more.publicPlaylistsV2 };
     }
-    throw new Error('Spotify is busy – trying again later');
+    const playlists = (u.publicPlaylistsV2?.items || []).map((it) => {
+      const id = String(it?._uri || it?.data?.uri || '').split(':')[2];
+      return SPOTIFY_ID.test(id || '') ? { id, name: it.data?.name || id, image: imageOfEntity(it.data?.images) } : null;
+    }).filter(Boolean);
+    return { name: u.name || user, playlists, total: u.publicPlaylistsV2?.totalCount || playlists.length };
   }
 
-  /** Every page of a list from Spotify's API. */
-  async function pages(first, max = 10000) {
-    const out = [];
-    let url = first;
-    while (url && out.length < max) {
-      const d = await spotify(url);
-      out.push(...(d.items || []));
-      url = d.next;
-    }
-    return out;
-  }
-
-  // ------------------------------------------------------------------ reading the playlists
-
-  const trackOf = (t) => (t && typeof t === 'object' && t.id && t.type !== 'episode'
-    ? { key: t.id, title: t.name || '', artists: (t.artists || []).map((a) => a.name).filter(Boolean).join(', '), duration: Math.round((Number(t.duration_ms) || 0) / 1000) }
-    : null);
-  // Since February 2026 a playlist entry holds the song in "item" (it used to be "track").
-  const entryTrack = (e) => trackOf(e && typeof e.item === 'object' ? e.item : e?.track);
-
-  /** The songs of a playlist someone else made: Spotify only shows them on its public page. */
-  async function publicTracks(id) {
-    const r = await fetch(`https://open.spotify.com/embed/playlist/${id}`, { headers: { 'user-agent': 'Mozilla/5.0 (Couchmate)' }, signal: AbortSignal.timeout(20000) });
-    if (!r.ok) throw new Error(`Spotify answered ${r.status} (is the playlist private?)`);
-    const m = /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/.exec(await r.text());
-    if (!m) throw new Error('Spotify\'s public page has changed');
-    const entity = JSON.parse(m[1])?.props?.pageProps?.state?.data?.entity;
-    return (entity?.trackList || []).map((t) => {
+  /** A public playlist's name, cover and songs (Spotify's embed page shows up to 100 of them). */
+  async function playlist(id) {
+    const m = /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/.exec(await page(`https://open.spotify.com/embed/playlist/${id}`));
+    if (!m) throw new Error('Spotify\'s page has changed');
+    const e = JSON.parse(m[1])?.props?.pageProps?.state?.data?.entity;
+    if (!e) throw new Error('not found on Spotify (is it private?)');
+    const tracks = (e.trackList || []).map((t) => {
       const key = String(t.uri || '').split(':')[2];
       return SPOTIFY_ID.test(key || '') && t.entityType !== 'episode'
         ? { key, title: t.title || '', artists: t.subtitle || '', duration: Math.round((Number(t.duration) || 0) / 1000) }
         : null;
     }).filter(Boolean);
+    const cover = [...(e.coverArt?.sources || [])].sort((a, b) => (b.width || 0) - (a.width || 0))[0]?.url || null;
+    return { name: e.name || e.title || id, owner: e.subtitle || '', image: cover, tracks };
   }
 
-  /** Reads the playlists again (only the ones that changed – Spotify's snapshot id says so). */
+  /** Reads every profile and playlist from the settings again. */
   async function sync() {
-    if (status.syncing || !token?.refresh || stopped) return;
+    if (status.syncing || stopped) return;
     status.syncing = true;
-    status.error = null;
+    const errors = [];
     try {
-      const me = token.user?.id;
+      const users = [...new Set(list(s().users).map(userOf).filter(Boolean))];
+      const wanted = new Map(); // playlist id → { owner, image, name }
+      const profiles = [];
+      for (const user of users) {
+        try {
+          const p = await profile(user);
+          profiles.push({ id: user, name: p.name, count: p.playlists.length, total: p.total });
+          for (const pl of p.playlists) if (!wanted.has(pl.id)) wanted.set(pl.id, { owner: p.name, image: pl.image, name: pl.name });
+        } catch (e) {
+          errors.push(`${user}: ${e.message}`);
+          profiles.push({ id: user, name: user, count: 0, error: e.message });
+        }
+      }
+      for (const v of list(s().playlists)) {
+        const id = playlistOf(v);
+        if (id && !wanted.has(id)) wanted.set(id, {});
+        else if (!id) errors.push(`${v}: not a Spotify playlist link`);
+      }
       const old = new Map(library.playlists.map((p) => [p.id, p]));
       const out = [];
-      if (s().liked !== false) {
+      for (const [id, hint] of wanted) {
         try {
-          const tracks = (await pages('/me/tracks?limit=50')).map((e) => trackOf(e.track ?? e.item)).filter(Boolean);
-          out.push({ id: 'liked', name: null, liked: true, image: null, owner: '', own: true, tracks });
-        } catch (e) { api.log(`liked songs: ${e.message}`); if (old.get('liked')) out.push(old.get('liked')); }
-      }
-      for (const pl of await pages('/me/playlists?limit=50')) {
-        if (!SPOTIFY_ID.test(pl?.id || '')) continue;
-        const own = pl.owner?.id === me || pl.collaborative === true;
-        if (!own && s().followed === false) continue;
-        const prev = old.get(pl.id);
-        let tracks = prev && prev.snapshot === pl.snapshot_id ? prev.tracks : null;
-        if (!tracks) {
-          try {
-            tracks = own ? (await pages(`/playlists/${pl.id}/items?limit=50`)).map(entryTrack).filter(Boolean) : await publicTracks(pl.id);
-          } catch (e) {
-            api.log(`${pl.name}: ${e.message}`);
-            tracks = prev?.tracks || [];
-          }
+          const pl = await playlist(id);
+          out.push({ id, name: pl.name || hint.name || id, owner: hint.owner || pl.owner, image: pl.image || hint.image || null, tracks: pl.tracks });
+        } catch (e) {
+          errors.push(`${hint.name || id}: ${e.message}`);
+          if (old.has(id)) out.push(old.get(id)); // keep what was read last time
         }
-        out.push({ id: pl.id, name: pl.name || pl.id, image: pl.images?.[0]?.url || null, owner: pl.owner?.display_name || '', own, snapshot: pl.snapshot_id, tracks });
       }
-      library = { playlists: out, syncedAt: Date.now() };
+      library = { playlists: out, users: profiles, syncedAt: Date.now() };
       save('library.json', library);
+      status.errors = errors;
+      if (errors.length) api.log(`could not read: ${errors.join('; ')}`);
       api.log(`read ${out.length} playlists with ${out.reduce((n, p) => n + p.tracks.length, 0)} songs`);
       matchAll();
-    } catch (e) {
-      status.error = e.message;
-      api.log(`could not read the playlists: ${e.message}`);
     } finally {
       status.syncing = false;
     }
@@ -201,7 +162,7 @@ export default function setup(api) {
       for (const p of library.playlists) p.tracks.forEach(add);
       status.left = todo.length;
       if (!todo.length) return;
-      if (!api.has(YOUTUBE, 'findVideo')) { status.error = 'Switch on the YouTube plugin – the songs are found with it'; return; }
+      if (!api.has(YOUTUBE, 'findVideo')) { status.errors = ['Switch on the YouTube plugin – the songs are found with it']; return; }
       api.log(`looking up ${todo.length} songs on YouTube`);
       let i = 0;
       let unsaved = 0;
@@ -212,7 +173,7 @@ export default function setup(api) {
             const v = await api.use(YOUTUBE, 'findVideo', `${t.artists} - ${t.title}`, { duration: t.duration });
             matches[t.key] = v?.id ? { v: v.id } : { none: Date.now() };
           } catch (e) {
-            if (!api.has(YOUTUBE, 'findVideo')) { status.error = 'The YouTube plugin was switched off'; i = todo.length; break; }
+            if (!api.has(YOUTUBE, 'findVideo')) { status.errors = ['The YouTube plugin was switched off']; i = todo.length; break; }
             api.log(`${t.artists} - ${t.title}: ${e.message}`);
           }
           status.left = Math.max(0, status.left - 1);
@@ -229,8 +190,7 @@ export default function setup(api) {
 
   // ------------------------------------------------------------------ what the YouTube plugin shows
 
-  const titleOf = (p) => (p.liked ? api.t('Liked songs') : p.name);
-  const imageOf = (p) => {
+  const coverOf = (p) => {
     if (p.image) return p.image;
     const v = p.tracks.map((t) => matches[t.key]?.v).find(Boolean);
     return v ? `https://i.ytimg.com/vi/${v}/hqdefault.jpg` : null;
@@ -238,14 +198,14 @@ export default function setup(api) {
 
   api.expose('youtubeRows', () => ({
     label: api.t('Playlists from Spotify'),
-    rows: library.playlists.length ? [{
+    rows: library.playlists.some((p) => p.tracks.length) ? [{
       id: 'playlists',
-      title: api.t('Your playlists from Spotify'),
+      title: api.t('Playlists from Spotify'),
       lists: library.playlists.filter((p) => p.tracks.length).map((p) => ({
         id: p.id,
-        title: titleOf(p),
-        subtitle: p.own ? api.t('{n} songs', { n: p.tracks.length }) : `${p.owner} · ${p.tracks.length}`,
-        image: imageOf(p),
+        title: p.name,
+        subtitle: p.owner ? `${p.owner} · ${p.tracks.length}` : api.t('{n} songs', { n: p.tracks.length }),
+        image: coverOf(p),
       })),
     }] : [],
   }));
@@ -260,94 +220,40 @@ export default function setup(api) {
       if (!m) pending++;
       return { id: m?.v || null, title: t.title, channel: t.artists, duration: t.duration, missing: m?.v ? undefined : m ? 'none' : 'pending' };
     });
-    return { title: titleOf(p), channel: p.own ? 'Spotify' : `Spotify · ${p.owner}`, videos, pending };
+    return { title: p.name, channel: p.owner ? `Spotify · ${p.owner}` : 'Spotify', videos, pending };
   });
 
-  // ------------------------------------------------------------------ the page in the admin panel
+  // ------------------------------------------------------------------ the status page in the admin panel
 
-  const page = (res, body, code = 200) => {
-    res.writeHead(code, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  api.route('GET', '/status', (req, res) => {
+    const n = library.playlists.reduce((sum, p) => sum + p.tracks.length, 0);
+    const found = library.playlists.reduce((sum, p) => sum + p.tracks.filter((t) => matches[t.key]?.v).length, 0);
+    const users = library.users.map((u) => `<li><b>${esc(u.name)}</b> <span class="dim">(${esc(u.id)})</span> – ${u.error ? `<span class="err">${esc(u.error)}</span>` : `${u.count} public playlists`}</li>`).join('');
+    const lists = library.playlists.map((p) => `<li>${esc(p.name)} <span class="dim">· ${esc(p.owner || 'link')} · ${p.tracks.length} songs, ${p.tracks.filter((t) => matches[t.key]?.v).length} found</span></li>`).join('');
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
     res.end(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Spotify → YouTube</title><style>
 body{font:15px/1.5 system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px;background:#0f1115;color:#e8eaf0}
-a{color:#7aa2ff}.card{background:#181b22;border-radius:12px;padding:16px 18px;margin:14px 0}.dim{color:#9aa0ad}
-.btn{display:inline-block;background:#1db954;color:#000;border:0;border-radius:20px;padding:9px 18px;font-weight:600;text-decoration:none;cursor:pointer;font-size:15px}
-.btn.grey{background:#2a2f3a;color:#e8eaf0}input{width:100%;box-sizing:border-box;padding:9px;border-radius:8px;border:1px solid #333a48;background:#0f1115;color:#e8eaf0}
-code{background:#0f1115;padding:2px 6px;border-radius:6px}.err{color:#ff7a7a}li{margin:2px 0}
-</style></head><body><h1>Spotify → YouTube</h1>${body}</body></html>`);
-  };
-  const back = (res, to = `${base}/login`) => { res.writeHead(303, { location: to }); res.end(); };
-  const readForm = (req) => new Promise((resolve) => {
-    let b = '';
-    req.on('data', (c) => { b += c; if (b.length > 20000) req.destroy(); });
-    req.on('end', () => resolve(new URLSearchParams(b)));
-  });
-
-  api.route('GET', '/login', (req, res, { query }) => {
-    const n = library.playlists.reduce((sum, p) => sum + p.tracks.length, 0);
-    const found = library.playlists.reduce((sum, p) => sum + p.tracks.filter((t) => matches[t.key]?.v).length, 0);
-    const parts = [];
-    if (query.get('error')) parts.push(`<p class="err">${esc(query.get('error'))}</p>`);
-    if (!s().clientId) {
-      parts.push(`<div class="card"><b>First:</b> make a Spotify app and fill in its Client ID in the plugin's settings.
-        <a href="https://github.com/valonia/couchmate-spotify-youtube#set-up" target="_blank">How (2 minutes) ↗</a></div>`);
-    } else if (!token?.refresh) {
-      parts.push(`<div class="card"><p>Not logged in.</p><p><a class="btn" href="${base}/authorize">Log in with Spotify</a></p>
-        <p class="dim">After logging in, Spotify sends you to <code>${esc(s().redirectUri)}</code>. If you are not on the computer that
-        runs Couchmate that page will not load – copy its whole address from the address bar and paste it here:</p>
-        <form method="post" action="${base}/connect"><input name="url" placeholder="http://127.0.0.1:…/callback?code=…" required>
-        <p><button class="btn grey" type="submit">Finish logging in</button></p></form></div>`);
-    } else {
-      parts.push(`<div class="card"><p>Logged in as <b>${esc(token.user?.name || '?')}</b>.</p>
-        <p>${library.playlists.length} playlists, ${n} songs – ${found} found on YouTube${status.left ? `, ${status.left} still being looked up` : ''}.
-        ${library.syncedAt ? `<br><span class="dim">Read ${esc(new Date(library.syncedAt).toLocaleString())}${status.syncing ? ' – reading again now…' : ''}</span>` : status.syncing ? '<br><span class="dim">Reading your playlists…</span>' : ''}</p>
-        ${status.error ? `<p class="err">${esc(status.error)}</p>` : ''}
-        <form method="post" action="${base}/sync" style="display:inline"><button class="btn grey">Read again now</button></form>
-        <form method="post" action="${base}/logout" style="display:inline;margin-left:8px"><button class="btn grey">Log out</button></form></div>
-        <div class="card"><p>In the YouTube plugin's settings, write <code>spotify-youtube</code> under <b>Topics on the front page</b> –
-        your playlists then show at the top of YouTube in the apps.</p>
-        <ul>${library.playlists.map((p) => `<li>${esc(p.liked ? 'Liked songs' : p.name)} <span class="dim">· ${p.tracks.length} songs${p.own ? '' : ` · by ${esc(p.owner)}`}</span></li>`).join('')}</ul></div>`);
-    }
-    page(res, parts.join(''));
+.card{background:#181b22;border-radius:12px;padding:16px 18px;margin:14px 0}.dim{color:#9aa0ad}.err{color:#ff7a7a}code{background:#0f1115;padding:2px 6px;border-radius:6px}
+.btn{background:#2a2f3a;color:#e8eaf0;border:0;border-radius:20px;padding:9px 18px;font-weight:600;cursor:pointer;font-size:15px}li{margin:2px 0}
+</style></head><body><h1>Spotify → YouTube</h1>
+${!list(s().users).length && !list(s().playlists).length ? '<div class="card">Write a Spotify username or profile link in the plugin\'s settings (e.g. <code>https://open.spotify.com/user/…</code>).</div>' : ''}
+<div class="card"><p>${library.playlists.length} playlists, ${n} songs – ${found} found on YouTube${status.left ? `, ${status.left} still being looked up` : ''}.
+${library.syncedAt ? `<br><span class="dim">Read ${esc(new Date(library.syncedAt).toLocaleString())}${status.syncing ? ' – reading again now…' : ''}</span>` : status.syncing ? '<br><span class="dim">Reading…</span>' : ''}</p>
+${status.errors.map((e) => `<p class="err">${esc(e)}</p>`).join('')}
+<form method="post" action="${base}/sync"><button class="btn">Read again now</button></form></div>
+${users ? `<div class="card"><b>Profiles</b><ul>${users}</ul></div>` : ''}
+${lists ? `<div class="card"><b>Playlists</b><ul>${lists}</ul></div>` : ''}
+<div class="card dim">In the YouTube plugin's settings, write <code>spotify-youtube</code> under <b>Topics on the front page</b> – the playlists then show at the top of YouTube in the apps.</div>
+</body></html>`);
   }, { auth: 'admin' });
-
-  api.route('GET', '/authorize', (req, res) => {
-    try { res.writeHead(302, { location: authorizeUrl() }); res.end(); } catch (e) { back(res, `${base}/login?error=${encodeURIComponent(e.message)}`); }
-  }, { auth: 'admin' });
-
-  // Spotify sends the browser here after logging in (works when the browser is on the computer running Couchmate).
-  api.route('GET', '/callback', async (req, res, { query }) => {
-    if (query.get('error')) return page(res, `<p class="err">Spotify said: ${esc(query.get('error'))}</p>`, 400);
-    try {
-      await finishLogin(query.get('code'), query.get('state'));
-      page(res, `<div class="card"><p>Logged in as <b>${esc(token.user.name)}</b>. Your playlists are being read now.</p>
-        <p class="dim">You can close this tab.</p></div>`);
-    } catch (e) {
-      page(res, `<p class="err">${esc(e.message)}</p>`, 400);
-    }
-  }, { auth: 'public' });
-
-  // The address Spotify sent the browser to, pasted in the admin page (when the browser is on another device).
-  api.route('POST', '/connect', async (req, res) => {
-    try {
-      const url = new URL(String((await readForm(req)).get('url') || '').trim());
-      if (url.searchParams.get('error')) throw new Error(`Spotify said: ${url.searchParams.get('error')}`);
-      await finishLogin(url.searchParams.get('code'), url.searchParams.get('state'));
-      back(res);
-    } catch (e) {
-      back(res, `${base}/login?error=${encodeURIComponent(e.message === 'Invalid URL' ? 'That is not the address from the address bar' : e.message)}`);
-    }
-  }, { auth: 'admin' });
-
-  api.route('POST', '/sync', (req, res) => { sync(); back(res); }, { auth: 'admin' });
-  api.route('POST', '/logout', (req, res) => { logout(); back(res); }, { auth: 'admin' });
-  api.link('Spotify login and status', `${base}/login`);
+  api.route('POST', '/sync', (req, res) => { sync(); res.writeHead(303, { location: `${base}/status` }); res.end(); }, { auth: 'admin' });
+  api.link('Status', `${base}/status`);
 
   // No api.source: this plugin has no menu entry or screens of its own – it only extends YouTube.
 
-  // Read the playlists now and every 30 minutes; look up songs that are still missing.
-  if (token?.refresh) setTimeout(() => sync(), 5000);
-  else setTimeout(() => matchAll(), 8000); // songs left from before a restart
+  // Read now (the settings may have changed – the plugin restarts then) and every 30 minutes.
+  setTimeout(() => sync(), 3000);
   timers.push(setInterval(() => sync(), 30 * 60 * 1000));
   return () => { stopped = true; timers.forEach(clearInterval); };
 }
