@@ -1,0 +1,43 @@
+{
+  "id": "spotify-youtube",
+  "name": "Spotify → YouTube",
+  "version": "1.0.0",
+  "description": "Your Spotify playlists, liked songs and the playlists you follow – played from YouTube. Write spotify-youtube as a topic in the YouTube plugin's settings and they show at the top of its front page. Nothing is created on YouTube: the songs are matched to YouTube videos and kept on this server.",
+  "main": "index.mjs",
+  "repository": "valonia/couchmate-spotify-youtube",
+  "needs": [
+    { "id": "youtube", "name": "YouTube", "repository": "valonia/couchmate-youtube" }
+  ],
+  "requires": "The YouTube plugin, switched on. A Spotify app made once on developer.spotify.com (its owner needs Spotify Premium) – see Read more.",
+  "homepage": "https://github.com/valonia/couchmate-spotify-youtube#set-up",
+  "settings": [
+    {
+      "key": "clientId",
+      "label": "Spotify Client ID",
+      "type": "text",
+      "default": "",
+      "required": true,
+      "help": "From your app on developer.spotify.com (Dashboard → your app → Settings)."
+    },
+    {
+      "key": "redirectUri",
+      "label": "Redirect URI",
+      "type": "text",
+      "default": "http://127.0.0.1:8787/plugins/spotify-youtube/callback",
+      "help": "Add exactly this under Redirect URIs in your Spotify app. Use the port the Couchmate server has on this computer (8787 unless you changed it)."
+    },
+    {
+      "key": "liked",
+      "label": "Include liked songs",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "followed",
+      "label": "Include playlists you follow",
+      "type": "bool",
+      "default": true,
+      "help": "Playlists made by others. Spotify only shows their songs on its public pages, so private ones are left out."
+    }
+  ]
+}
