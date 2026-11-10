@@ -40,6 +40,31 @@ registered with Spotify; you make it once – it takes about two minutes. Its ow
 The playlists are read straight away and every 30 minutes after that. Looking up the songs on YouTube takes a while
 the first time (a few seconds per song) – the first songs of every playlist are looked up first.
 
+## Invites
+
+Let someone connect their own Spotify account from their phone – without the admin panel:
+
+1. Give the plugin a **public address**: an https address that reaches this server's `/plugins/spotify-youtube`
+   pages from the internet. Only these pages need to be public – the apps, the admin panel and the streams can stay
+   private. Some ways:
+   - **Tailscale Funnel** (free, no domain): on the computer running Couchmate, with HTTPS and Funnel switched on in
+     Tailscale's admin console:
+
+     `tailscale funnel --bg --set-path /plugins/spotify-youtube http://127.0.0.1:8787/plugins/spotify-youtube`
+
+     (use your server's port). The address is `https://<computer>.<tailnet>.ts.net`.
+   - **Cloudflare Tunnel** with a domain of your own, to `http://localhost:8787` (a path rule can limit it to
+     `/plugins/spotify-youtube`).
+   - A reverse proxy (Caddy, Nginx) with a domain and HTTPS.
+2. In the plugin's settings, fill in **Public address** (e.g. `https://bob.tail1234.ts.net`).
+3. In your Spotify app, add `<public address>/plugins/spotify-youtube/callback` under **Redirect URIs**, and add
+   the person's Spotify account under **User Management**.
+4. On the Status page, press **Create invite** and send them the link. It works once and for 7 days, and only lets
+   them connect a Spotify account. They open it, press **Connect my Spotify**, log in – and their playlists show
+   up as a row of their own.
+
+With a public address you can also log in yourself from any device.
+
 ## What is included
 
 - **Your playlists** – the ones you made or collaborate on, private ones too, with every song.

@@ -1,12 +1,16 @@
 {
   "id": "spotify-youtube",
   "name": "Spotify → YouTube",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Spotify playlists, liked songs and followed playlists from one or more accounts – played from YouTube. Write spotify-youtube as a topic in the YouTube plugin's settings and they show at the top of its front page. Nothing is created on YouTube: the songs are matched to YouTube videos and kept on this server.",
   "main": "index.mjs",
   "repository": "valonia/couchmate-spotify-youtube",
   "needs": [
-    { "id": "youtube", "name": "YouTube", "repository": "valonia/couchmate-youtube" }
+    {
+      "id": "youtube",
+      "name": "YouTube",
+      "repository": "valonia/couchmate-youtube"
+    }
   ],
   "requires": "The YouTube plugin, switched on. A Spotify app made once on developer.spotify.com (its owner needs Spotify Premium) – see Read more.",
   "homepage": "https://github.com/valonia/couchmate-spotify-youtube#set-up",
@@ -24,7 +28,15 @@
       "label": "Redirect URI",
       "type": "text",
       "default": "http://127.0.0.1:8787/plugins/spotify-youtube/callback",
-      "help": "Add exactly this under Redirect URIs in your Spotify app. Use the port the Couchmate server has on its computer (8787 unless you changed it)."
+      "help": "Used when no public address is set: add exactly this under Redirect URIs in your Spotify app. Use the port the Couchmate server has on its computer (8787 unless you changed it)."
+    },
+    {
+      "key": "publicUrl",
+      "label": "Public address (for invite links)",
+      "type": "text",
+      "default": "",
+      "placeholder": "https://…",
+      "help": "Optional. An https address that reaches this server's /plugins/spotify-youtube pages from the internet – e.g. Tailscale Funnel or a Cloudflare tunnel. Lets you send invite links, and log in from any device. Add <address>/plugins/spotify-youtube/callback as a Redirect URI in your Spotify app."
     },
     {
       "key": "liked",

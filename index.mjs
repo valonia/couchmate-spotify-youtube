@@ -10,6 +10,8 @@
 //   is remembered. Nothing is created on YouTube or Spotify.
 // - Write "spotify-youtube" as a topic in the YouTube plugin's settings: a row per account shows at the top of its
 //   front page. The playlists open, play, queue and can be added to favourites like YouTube playlists.
+// - Invites: with a public address set (e.g. Tailscale Funnel or a Cloudflare tunnel to this plugin's pages), the admin
+//   can send someone a link – they connect their own Spotify account from their phone, without the admin panel.
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -46,7 +48,9 @@ export default function setup(api) {
   // EMBED_MAX of total (a playlist someone follows).
   let library = load('library.json', { playlists: [], syncedAt: null });
   const matches = load('matches.json', {}); // Spotify track id → { v: YouTube video id } or { none: time }
-  const logins = new Map(); // state → { verifier, at } while the admin is logging in
+  const logins = new Map(); // state → { verifier, at, redirect, invite } while someone is logging in
+  let invites = load('invites.json', []); // [{ code, name, createdAt, expiresAt }] – links that connect an account once
+  const INVITE_DAYS = 7
   const status = { syncing: false, errors: [], left: 0 };
   let stopped = false;
   const timers = [];
@@ -95,16 +99,32 @@ export default function setup(api) {
   // ------------------------------------------------------------------ logging in (OAuth with PKCE – no secret needed)
 
   const loginReady = () => Boolean(String(s().clientId || '').trim());
+  /** The public address of this server (for invite links), without a trailing slash – or null. */
+  const publicBase = () => {
+    const v = String(s().publicUrl || '').trim().replace(/\/+$/, '');
+    return /^https:\/\/[^/\s]+(\/[^\s]*)?$/i.test(v) ? v : null;
+  };
+  /** Where Spotify sends the browser back: the public address if there is one, else the one in the settings. */
+  const redirectUri = () => (publicBase() ? `${publicBase()}${base}/callback` : String(s().redirectUri || '').trim());
+
+  const liveInvites = () => {
+    const now = Date.now();
+    const kept = invites.filter((i) => i.expiresAt > now);
+    if (kept.length !== invites.length) { invites = kept; save('invites.json', invites); }
+    return invites;
+  };
+  const inviteLink = (code) => `${publicBase()}${base}/invite/${code}`;
   const b64url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
-  function authorizeUrl() {
+  function authorizeUrl(invite = null) {
     if (!loginReady()) throw new Error('Fill in the Spotify Client ID in the plugin\'s settings first');
     const verifier = b64url(crypto.randomBytes(48));
     const state = b64url(crypto.randomBytes(16));
     for (const [k, v] of logins) if (Date.now() - v.at > 15 * 60 * 1000) logins.delete(k);
-    logins.set(state, { verifier, at: Date.now() });
+    const redirect = redirectUri();
+    logins.set(state, { verifier, at: Date.now(), redirect, invite });
     const q = new URLSearchParams({
-      client_id: s().clientId.trim(), response_type: 'code', redirect_uri: s().redirectUri.trim(), scope: SCOPES, state,
+      client_id: s().clientId.trim(), response_type: 'code', redirect_uri: redirect, scope: SCOPES, state,
       code_challenge_method: 'S256', code_challenge: b64url(crypto.createHash('sha256').update(verifier).digest()),
       // Always ask – so another account can be added (Spotify's page has "Not you?").
       show_dialog: 'true',
@@ -127,14 +147,20 @@ export default function setup(api) {
     const l = logins.get(String(state || ''));
     if (!l) throw new Error('This login has expired – start it again');
     logins.delete(state);
-    const d = await tokenRequest({ grant_type: 'authorization_code', code: String(code || ''), redirect_uri: s().redirectUri.trim(), code_verifier: l.verifier });
+    // An invite is used once – checked again here, it may have been revoked meanwhile.
+    if (l.invite && !liveInvites().some((i) => i.code === l.invite)) throw new Error('This invite has expired or was withdrawn – ask for a new one');
+    const d = await tokenRequest({ grant_type: 'authorization_code', code: String(code || ''), redirect_uri: l.redirect, code_verifier: l.verifier });
     const acct = { access: d.access_token, refresh: d.refresh_token, expiresAt: Date.now() + (Number(d.expires_in) - 60) * 1000, user: null };
     const me = await spotify(acct, '/me');
     acct.user = { id: me.id, name: me.display_name || me.id };
     // The same account again replaces it; another one is added.
     accounts = [...accounts.filter((a) => a.user?.id !== acct.user.id), acct];
     saveAccounts();
-    api.log(`logged in as ${acct.user.name}`);
+    if (l.invite) {
+      invites = invites.filter((i) => i.code !== l.invite);
+      save('invites.json', invites);
+    }
+    api.log(`logged in as ${acct.user.name}${l.invite ? ' (invite)' : ''}`);
     sync();
     return acct;
   }
@@ -388,10 +414,30 @@ input{width:100%;box-sizing:border-box;padding:9px;border-radius:8px;border:1px 
         <p><a class="btn green" href="${base}/authorize">${accounts.length ? 'Add another account' : 'Log in with Spotify'}</a></p>
         <p class="dim">Each account must be added under <b>User Management</b> in your Spotify app (at most 5). To add someone
         else's, choose <b>Not you?</b> on Spotify's page – or log in from a private browser window.</p>
-        <p class="dim">After logging in, Spotify sends you to <code>${esc(s().redirectUri)}</code>. If you are not on the computer that runs
+        ${publicBase() ? '' : `<p class="dim">After logging in, Spotify sends you to <code>${esc(redirectUri())}</code>. If you are not on the computer that runs
         Couchmate that page will not load – copy its whole address from the address bar and paste it here:</p>
         <form method="post" action="${base}/connect"><input name="url" placeholder="http://127.0.0.1:…/callback?code=…" required>
-        <p><button class="btn" type="submit">Finish logging in</button></p></form></div>`);
+        <p><button class="btn" type="submit">Finish logging in</button></p></form>`}
+        <p class="dim">Redirect URI to add in your Spotify app: <code>${esc(redirectUri())}</code></p></div>`);
+
+      // Invites: a link someone opens on their phone to connect their own Spotify account.
+      if (publicBase()) {
+        const rows = liveInvites().map((i) => `<div class="acct"><span class="grow"><b>${esc(i.name || 'Invite')}</b>
+          <span class="dim">· until ${esc(new Date(i.expiresAt).toLocaleDateString())}</span><br>
+          <input readonly value="${esc(inviteLink(i.code))}" onclick="this.select()" style="margin-top:6px"></span>
+          <form method="post" action="${base}/invites/remove"><input type="hidden" name="code" value="${esc(i.code)}"><button class="btn small">Withdraw</button></form></div>`).join('');
+        parts.push(`<div class="card"><b>Invites</b>
+          <p class="dim">Send someone a link: they open it on their phone and connect their own Spotify account – no admin panel
+          needed. A link works once and for ${INVITE_DAYS} days. Add their Spotify account under <b>User Management</b> in your Spotify
+          app first (at most 5 accounts).</p>
+          ${rows}
+          <form method="post" action="${base}/invites" style="display:flex;gap:8px;margin-top:10px">
+          <input name="name" placeholder="Who is it for? (e.g. Anna)" maxlength="40"><button class="btn green" type="submit">Create invite</button></form></div>`);
+      } else {
+        parts.push(`<div class="card dim"><b>Invites</b> – fill in <b>Public address</b> in the plugin's settings (e.g. a Tailscale Funnel
+          or Cloudflare tunnel address) to send people a link that connects their own Spotify account.
+          <a href="https://github.com/valonia/couchmate-spotify-youtube#invites" target="_blank">How ↗</a></div>`);
+      }
     }
 
     parts.push(`<div class="card"><p>${library.playlists.length} playlists, ${n} songs – ${found} found on YouTube${status.left ? `, ${status.left} still being looked up` : ''}.
@@ -420,7 +466,7 @@ input{width:100%;box-sizing:border-box;padding:9px;border-radius:8px;border:1px 
     if (query.get('error')) return html(res, `<p class="err">Spotify said: ${esc(query.get('error'))}</p>`, 400);
     try {
       const acct = await finishLogin(query.get('code'), query.get('state'));
-      html(res, `<div class="card"><p>Logged in as <b>${esc(acct.user.name)}</b>. The playlists are being read now.</p><p class="dim">You can close this tab.</p></div>`);
+      html(res, `<div class="card"><p>Done – <b>${esc(acct.user.name)}</b> is connected. The playlists show up in Couchmate in a few minutes.</p><p class="dim">You can close this page.</p></div>`);
     } catch (e) {
       html(res, `<p class="err">${esc(e.message)}</p>`, 400);
     }
@@ -437,6 +483,37 @@ input{width:100%;box-sizing:border-box;padding:9px;border-radius:8px;border:1px 
       back(res, `${base}/status?error=${encodeURIComponent(e.message === 'Invalid URL' ? 'That is not the address from the address bar' : e.message)}`);
     }
   }, { auth: 'admin' });
+
+  api.route('POST', '/invites', async (req, res) => {
+    if (!publicBase()) return back(res, `${base}/status?error=${encodeURIComponent('Fill in the public address first')}`);
+    const name = String((await readForm(req)).get('name') || '').trim().slice(0, 40);
+    liveInvites();
+    invites.push({ code: b64url(crypto.randomBytes(18)), name, createdAt: Date.now(), expiresAt: Date.now() + INVITE_DAYS * 24 * 3600 * 1000 });
+    save('invites.json', invites);
+    back(res);
+  }, { auth: 'admin' });
+  api.route('POST', '/invites/remove', async (req, res) => {
+    const code = String((await readForm(req)).get('code') || '');
+    invites = invites.filter((i) => i.code !== code);
+    save('invites.json', invites);
+    back(res);
+  }, { auth: 'admin' });
+
+  // The page someone gets a link to: one button that connects their Spotify account. Public, but only with a valid code.
+  api.route('GET', '/invite/*', (req, res, { path: rest }) => {
+    const [code, step] = String(rest || '').split('/');
+    const inv = liveInvites().find((i) => i.code === code);
+    if (!inv || !publicBase() || !loginReady()) {
+      return html(res, '<div class="card"><p>This invite has expired or was withdrawn.</p><p class="dim">Ask the person who sent it for a new one.</p></div>', 404);
+    }
+    if (step === 'go') {
+      try { res.writeHead(302, { location: authorizeUrl(inv.code) }); return res.end(); } catch (e) { return html(res, `<p class="err">${esc(e.message)}</p>`, 500); }
+    }
+    html(res, `<div class="card"><p>${inv.name ? `Hi ${esc(inv.name)}! ` : ''}Connect your Spotify account to Couchmate – your playlists and liked songs
+      then show up in Couchmate's YouTube, to play together.</p>
+      <p><a class="btn green" href="${base}/invite/${esc(inv.code)}/go">Connect my Spotify</a></p>
+      <p class="dim">Couchmate only reads your playlists and liked songs. Nothing is changed on your Spotify account.</p></div>`);
+  }, { auth: 'public' });
 
   api.route('POST', '/sync', (req, res) => { sync(); back(res); }, { auth: 'admin' });
   api.route('POST', '/logout', async (req, res) => { logout(String((await readForm(req)).get('id') || '')); back(res); }, { auth: 'admin' });
