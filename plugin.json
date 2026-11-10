@@ -1,8 +1,8 @@
 {
   "id": "spotify-youtube",
   "name": "Spotify → YouTube",
-  "version": "3.0.0",
-  "description": "Your Spotify playlists, liked songs and the playlists you follow – played from YouTube. Write spotify-youtube as a topic in the YouTube plugin's settings and they show at the top of its front page. Nothing is created on YouTube: the songs are matched to YouTube videos and kept on this server.",
+  "version": "3.1.0",
+  "description": "Spotify playlists, liked songs and followed playlists from one or more accounts – played from YouTube. Write spotify-youtube as a topic in the YouTube plugin's settings and they show at the top of its front page. Nothing is created on YouTube: the songs are matched to YouTube videos and kept on this server.",
   "main": "index.mjs",
   "repository": "valonia/couchmate-spotify-youtube",
   "needs": [

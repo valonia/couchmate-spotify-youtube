@@ -1,6 +1,7 @@
 # Spotify → YouTube – a Couchmate plugin
 
-Your Spotify playlists, liked songs and the playlists you follow – played from YouTube, in sync for everyone.
+Spotify playlists, liked songs and the playlists you follow – from one or more Spotify accounts – played from YouTube,
+in sync for everyone.
 
 It extends the YouTube plugin: write `spotify-youtube` as a topic in the YouTube plugin's settings and your
 playlists show at the top of its front page. They open, play, have a queue, go straight from song to song and
@@ -25,13 +26,15 @@ registered with Spotify; you make it once – it takes about two minutes. Its ow
    Use the port your Couchmate server has on its computer – 8787 unless you changed it (for example `8788`).
 3. Tick **Web API**, accept the terms and save.
 4. Open the app's **Settings** and copy the **Client ID**.
-5. Under **User Management**, add the Spotify account whose playlists should be read.
+5. Under **User Management**, add every Spotify account whose playlists should be read (at most 5).
 6. In the Couchmate admin panel: **Plugins → Spotify → YouTube → Settings**. Paste the Client ID. If you used
    another port in step 2, change **Redirect URI** to match exactly.
 7. On the plugin's card, open **Status and Spotify login** and press **Log in with Spotify**.
    - On the computer that runs Couchmate, you come straight back and you are done.
    - On another device, the last page will not load. Copy its whole address from the address bar, paste it on the
      Status page and press **Finish logging in**.
+   - More accounts: press **Add another account** and choose **Not you?** on Spotify's page (or use a private
+     browser window). Each account gets a row of its own on YouTube's front page; log one out on the Status page.
 8. In the YouTube plugin's settings, add `spotify-youtube` to **Topics on the front page**.
 
 The playlists are read straight away and every 30 minutes after that. Looking up the songs on YouTube takes a while
